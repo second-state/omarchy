@@ -1,0 +1,115 @@
+#!/bin/bash
+
+# omarchy:summary=Install WasmEdge Agent as a lazy launcher in ~/.local/bin
+# omarchy:args=[--check|--now|--owns]
+# omarchy:examples=omarchy install wasmedge agent | omarchy install wasmedge agent --now
+# omarchy:requires-sudo=true
+
+# WasmEdge Agent is not a mise tool and not a pacman package. Its own release
+# installer provisions the whole runtime -- WasmEdge, the wasm32-wasip1 Rust
+# target, the agent, and the cell workspace the agent compiles into -- and stays
+# the only authority on it. This command owns nothing but the launcher it writes
+# and the question of who wrote it.
+#
+# The launcher exists so a fresh Omarchy resolves wasmedge-agent before the agent
+# is installed, without the agent binary entering the ISO. Omarchy puts
+# ~/.local/share/mise/shims ahead of ~/.local/bin on PATH, so once the install
+# finishes and reshims, the shim precedes the launcher and the launcher stops
+# being reached at all. It goes dormant rather than being deleted, and it is
+# still there if the agent is later removed.
+
+set -euo pipefail
+
+mode=${1:-}
+
+launcher="$HOME/.local/bin/wasmedge-agent"
+
+# The line that identifies the launcher as this command's; matched whole, so a
+# wrapper that merely mentions the command is not mistaken for ours.
+marker='# Written by omarchy-install-wasmedge-agent.'
+
+# The first wasmedge-agent on PATH that is not the launcher, then the global npm
+# prefix, which covers the window between the package install and the reshim that
+# gives it a mise shim. Prints the path that answered, so a caller can say which
+# binary it found.
+#
+# The launcher carries the same rule inline. It has to work when this command is
+# absent or broken, so the duplication is deliberate, and the shell tests assert
+# that the two agree.
+real_agent() {
+  local candidate prefix
+
+  while IFS= read -r candidate; do
+    [[ -f $candidate && -x $candidate ]] || continue
+    if grep -qxF "$marker" "$candidate" 2>/dev/null; then
+      continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done < <(type -aP wasmedge-agent 2>/dev/null)
+
+  prefix=$(npm prefix -g 2>/dev/null) || return 1
+  [[ -n $prefix && -f $prefix/bin/wasmedge-agent && -x $prefix/bin/wasmedge-agent ]] || return 1
+  # The whole-line marker test the PATH candidates get, for the same reason. When
+  # npm's global prefix is ~/.local -- the ordinary way to avoid sudo npm -- this
+  # candidate is the launcher, and answering with it makes the launcher exec
+  # itself forever.
+  if grep -qxF "$marker" "$prefix/bin/wasmedge-agent" 2>/dev/null; then
+    return 1
+  fi
+  printf '%s\n' "$prefix/bin/wasmedge-agent"
+}
+
+# Whether the runtime is ready, which is what the default agent asks before it
+# opens the TUI. Reads only. The cold launcher is never run: real_agent skips it,
+# and running it would start a minutes-long install from inside a question.
+runtime_ready() {
+  local agent report
+
+  agent=$(real_agent) || return 1
+  timeout 15 "$agent" --version >/dev/null 2>&1 || return 1
+  report=$(timeout 30 "$agent" doctor --json 2>/dev/null) || return 1
+
+  # Read out of the report rather than from the exit status: doctor reports and
+  # exits 0 whatever it finds, and doctor --fix is the mode that repairs, which is
+  # the one thing this must not do. An empty runtime array means nothing was
+  # checked, which is not the same as healthy.
+  printf '%s' "$report" |
+    jq -e '(.runtime | type) == "array" and (.runtime | length) > 0 and all(.runtime[]; .ok == true)' >/dev/null 2>&1
+}
+
+# Whether the file at a path is a launcher this command wrote. Asked of the
+# launcher path, and of the paths a launcher is moved to while the path it came
+# from is worked on. A link is somebody else's arrangement even when it resolves
+# to a marked file, because the launcher is written as a regular file.
+omarchy_wrote() {
+  [[ -f $1 && ! -L $1 ]] && grep -qxF "$marker" "$1" 2>/dev/null
+}
+
+# The launcher is the only thing this command owns. Anything else at that path --
+# another installer's wrapper, a hand-rolled script, a symbolic link, even a
+# dangling one -- was put there by the user and is never written over or removed.
+omarchy_owns_launcher() {
+  omarchy_wrote "$launcher"
+}
+
+case "$mode" in
+  --owns)
+    if omarchy_owns_launcher; then
+      exit 0
+    else
+      exit 1
+    fi
+    ;;
+  --check)
+    if runtime_ready; then
+      exit 0
+    else
+      exit 1
+    fi
+    ;;
+  *)
+    echo "Usage: omarchy-install-wasmedge-agent [--check|--now|--owns]" >&2
+    exit 2
+    ;;
+esac
