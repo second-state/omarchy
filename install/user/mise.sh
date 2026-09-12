@@ -29,3 +29,11 @@ omarchy-install-hermes-cli || true
 if omarchy-cmd-missing muse; then
   omarchy-mise-install "http:muse[url=https://api.meta.ai/muse-launcher.sh,bin=muse,version_list_url=https://api.meta.ai/muse-code/channels/muse-stable,version_json_path=.version]" muse
 fi
+
+# WasmEdge Agent is not a mise tool: its own installer provisions WasmEdge, the
+# wasm32-wasip1 Rust target, and the cell workspace as well as the agent. This
+# writes the lazy launcher and downloads nothing; the first run of
+# wasmedge-agent installs the runtime. `|| true` for the reason
+# omarchy-install-hermes-cli carries it: this leaf is sourced under `bash -eE`,
+# and a failure here would abort the rest of omarchy-provision-user.
+omarchy-install-wasmedge-agent || true
