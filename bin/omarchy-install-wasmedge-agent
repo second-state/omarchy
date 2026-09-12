@@ -24,9 +24,34 @@ mode=${1:-}
 
 launcher="$HOME/.local/bin/wasmedge-agent"
 
+# Where the launcher waits out an install that needs its own path. A sibling, so
+# moving it is a rename inside one directory and cannot fail across file
+# systems, and hidden, so nothing resolves wasmedge-agent through it.
+launcher_aside="$HOME/.local/bin/.wasmedge-agent.omarchy-aside"
+
+install_log="$HOME/.local/state/omarchy/wasmedge-agent-install.log"
+
+# Records the command an install of this command's left at the launcher path
+# when it could not finish. Written only once npm has published that command,
+# and removed once the runtime answers ready, so what survives a failure names
+# the one link a retry may reclaim. An install that failed before npm published
+# anything leaves nothing behind, and so claims nothing.
+install_pending="$HOME/.local/state/omarchy/wasmedge-agent-install.pending"
+
 # The line that identifies the launcher as this command's; matched whole, so a
 # wrapper that merely mentions the command is not mistaken for ours.
 marker='# Written by omarchy-install-wasmedge-agent.'
+
+# The name the agent is published under, which is also the directory npm gives it
+# in the global module tree and the command it links into the global bin
+# directory. Used to tell npm's command for this package from npm's command for
+# any other one.
+npm_package='wasmedge-agent'
+
+# Overridable so the tests and a clean-guest validation can point at a local
+# mirror: the release repository is private, and GitHub does not serve a private
+# repository's assets anonymously.
+installer_url=${OMARCHY_WASMEDGE_AGENT_INSTALLER_URL:-https://github.com/second-state/wasmedge-agent/releases/latest/download/install.sh}
 
 # The first wasmedge-agent on PATH that is not the launcher, then the global npm
 # prefix, which covers the window between the package install and the reshim that
@@ -252,6 +277,109 @@ write_launcher() {
   return 1
 }
 
+# Where npm creates its global commands. `npm prefix -g` can answer a path that
+# reaches its directory through symbolic links, so canonicalise it -- -m because
+# the directory need not exist yet. A plain string compare against the
+# launcher's own directory would miss a collision that is real.
+npm_bin_dir() {
+  local prefix
+
+  prefix=$(npm prefix -g 2>/dev/null) || return 1
+  [[ -n $prefix ]] || return 1
+  realpath -m -- "$prefix/bin"
+}
+
+# Whether npm would create its wasmedge-agent at the launcher's own path. On a
+# machine whose global prefix is ~/.local -- `npm config set prefix ~/.local`,
+# the ordinary way to avoid sudo npm -- it would, and npm refuses to create its
+# command over a file it did not create: it reports EEXIST and exits 1. There
+# the launcher is what makes the install fail.
+npm_wants_launcher_path() {
+  local npm_dir launcher_dir
+
+  npm_dir=$(npm_bin_dir) || return 1
+  launcher_dir=$(realpath -m -- "$(dirname "$launcher")") || return 1
+  [[ $npm_dir == "$launcher_dir" ]]
+}
+
+# Whether the launcher's path holds the command npm created for the agent's own
+# package rather than a file the user put there. npm publishes a global command
+# as a symbolic link into its own module tree, so a path that resolves inside
+# that tree is npm's work and nobody's hand-rolled wrapper. Only ever true when
+# npm's global prefix is the launcher's own directory, which is the one
+# arrangement where npm's command and the launcher want the same path.
+npm_owns_launcher() {
+  local prefix module target
+
+  npm_wants_launcher_path || return 1
+  [[ -L $launcher ]] || return 1
+
+  prefix=$(npm prefix -g 2>/dev/null) || return 1
+  [[ -n $prefix ]] || return 1
+  # The agent's own package directory, and not the module tree around it: npm
+  # creates a command for every package that asks for one, and a link into some
+  # other package's directory is that package's command. It is no more this
+  # command's than a hand-rolled wrapper is, and reading it as ours starts an
+  # install that npm can only end with EEXIST.
+  module=$(realpath -m -- "$prefix/lib/node_modules/$npm_package") || return 1
+
+  # Resolves the link. A dangling one answers nothing and stays foreign: it runs
+  # nothing, so calling it an installed agent would be a lie.
+  target=$(realpath -- "$launcher" 2>/dev/null) || return 1
+  [[ $target == "$module"/* ]]
+}
+
+# What identifies the command npm published: the link itself, and not what it
+# resolves to. Every install of the package leaves a link naming the same
+# target, so the target alone tells two of them apart no better than the path
+# does. The link's own inode and timestamp do, and stat reads the link rather
+# than following it.
+#
+# Seconds since the epoch rather than a rendered time: the same instant renders
+# differently in another timezone, and a record written before a machine changed
+# zones would name a link that no longer matches its own. Two links a second
+# apart are told apart by the inode; two within one second, from a second
+# installer running at the same moment, are not.
+launcher_identity() {
+  stat -c '%i %Y %N' -- "$launcher" 2>/dev/null
+}
+
+# Records the command an install left at the launcher path, for the retry that
+# has to reclaim it. Only npm's command for the agent is ever recorded, and only
+# as the exact link standing there now. Run from the exit trap, because an
+# install can end between npm publishing its command and the installer
+# returning -- a signal does exactly that -- and the paths that handle a failing
+# installer never run then.
+record_interrupted_install() {
+  if npm_owns_launcher && mkdir -p "$(dirname "$install_pending")" &&
+    launcher_identity >"$install_pending"; then
+    return 0
+  fi
+
+  # There is nothing to reclaim, or the record could not be written. Either way
+  # the next run must find no claim: a retry refused costs a message, and a
+  # claim over a command this install did not publish costs the user theirs.
+  rm -f -- "$install_pending"
+  return 0
+}
+
+# Whether npm's command for the agent holds the launcher path because an install
+# this command started never finished. An install of ours that was cut short
+# after npm published its command leaves exactly the link a user's own
+# `npm install -g wasmedge-agent` leaves, so the link cannot tell the two apart
+# and the record is what does -- naming the command that install published, not
+# merely that one ran. Anything else at that path is the user's own, and a file
+# this command did not write is never installed over.
+omarchy_install_interrupted() {
+  local recorded
+
+  [[ -f $install_pending ]] || return 1
+  npm_owns_launcher || return 1
+
+  recorded=$(cat "$install_pending" 2>/dev/null) || return 1
+  [[ -n $recorded && $(launcher_identity) == "$recorded" ]]
+}
+
 # Puts a file that was moved off the launcher path back, or drops it once it is
 # no longer wanted. Idempotent, so it is safe on every exit.
 #
@@ -292,6 +420,40 @@ restore_displaced() {
   echo "It was moved off the launcher path and left there. Move it back or remove it." >&2
 }
 
+# Whether the launcher has to step out of the install's way: npm's global prefix
+# is the launcher's own directory, so the command npm creates wants the path the
+# launcher holds, and npm refuses to write over a file it did not create.
+launcher_must_step_aside() {
+  npm_wants_launcher_path && omarchy_owns_launcher
+}
+
+# Downloads the agent's own installer and runs it unattended. Its output goes to
+# the terminal and to a log, which is what makes a failure readable after a
+# floating terminal has closed.
+install_runtime() {
+  local script status=0
+
+  mkdir -p "$(dirname "$install_log")"
+  script=$(mktemp) || return 1
+
+  # To a file and then run, rather than piped into a shell: a pipe runs whatever
+  # arrived before the connection broke, and a file either downloaded or did not.
+  if ! curl -fsSL "$installer_url" -o "$script"; then
+    rm -f "$script"
+    echo "Could not download the WasmEdge Agent installer from $installer_url" >&2
+    return 1
+  fi
+
+  # --yes is the installer's unattended mode: every prompt takes its default,
+  # which is to install. The sentinel is exported for that run alone, and the
+  # launcher reads it to know it is already inside this install and must not ask
+  # for another one.
+  OMARCHY_WASMEDGE_AGENT_INSTALLING=1 sh "$script" --yes 2>&1 | tee -a "$install_log" || status=$?
+  rm -f "$script"
+
+  return "$status"
+}
+
 case "$mode" in
   "")
     # A user who installed their own agent is not an error state, and the
@@ -301,6 +463,91 @@ case "$mode" in
     else
       write_launcher
     fi
+    ;;
+  --now)
+    # A command npm created for the agent's own package holds the launcher's
+    # path on any machine whose global prefix is ~/.local, and it gets there two
+    # ways: an install of this command's that was cut short after npm published
+    # it, and a user's own `npm install -g`. Refusing the first would strand the
+    # state a retry exists for -- that install takes the launcher with it, since
+    # the copy moved aside is dropped when the path it would return to is
+    # occupied, and nothing would ever run the idempotent installer again.
+    # Installing over the second would write over an installation this command
+    # did not make. The link is the same either way, so the record of an
+    # unfinished install is what separates them.
+    if foreign_launcher && ! omarchy_install_interrupted; then
+      # Not ours to replace. A working one is what the default agent will run,
+      # and a broken one is the user's to fix.
+      if runtime_ready; then
+        exit 0
+      else
+        echo "$launcher was not installed by Omarchy, and the WasmEdge Agent runtime is not ready." >&2
+        echo "Fix or remove it, then run omarchy-install-wasmedge-agent --now again." >&2
+        exit 1
+      fi
+    fi
+
+    # Written before the install, so a failed install leaves a launcher that can
+    # try again rather than a machine with no wasmedge-agent at all.
+    write_launcher
+
+    # The aside path is a fixed name, and the move onto it is a rename, which
+    # replaces what it finds. Anything there this command did not write was left
+    # by a restore that had nowhere to put it back, and moving over it would
+    # destroy the very file that restore went out of its way to keep. Refused
+    # before the trap below is armed, because nothing has been displaced yet.
+    if launcher_must_step_aside &&
+      [[ -e $launcher_aside || -L $launcher_aside ]] &&
+      ! omarchy_wrote "$launcher_aside"; then
+      echo "$launcher_aside was not written by Omarchy, and the WasmEdge Agent install needs that path." >&2
+      echo "Move it out of that directory or remove it, then run omarchy-install-wasmedge-agent --now again." >&2
+      exit 1
+    fi
+
+    # Everything this command owes the machine on the way out, in the one place
+    # every exit runs -- an error, a refusal, or a signal that ends the shell
+    # mid-install. What was moved aside goes back if the path is free, and what
+    # npm published is recorded if it holds the path instead. An install cut
+    # short after npm published has to stay retryable however it was cut short,
+    # and a signal reaches neither failure path below.
+    trap 'restore_displaced "$launcher_aside"; record_interrupted_install' EXIT
+
+    # When npm's global prefix is the launcher's own directory, the launcher
+    # occupies the exact path the install needs, and npm refuses to write over
+    # it. Move ours out of the way for the duration of the install, and the trap
+    # puts it back unless the install produced something better.
+    #
+    # Nothing foreign reaches here: the foreign_launcher test above exits first,
+    # and omarchy_owns_launcher asks again at this point.
+    if launcher_must_step_aside; then
+      # Renaming a script that is running is safe: the rename keeps the inode
+      # and the shell keeps its open descriptor. That matters, because the
+      # launcher itself is what usually calls --now.
+      if ! mv -fT -- "$launcher" "$launcher_aside"; then
+        echo "Could not move $launcher aside for the WasmEdge Agent install." >&2
+        exit 1
+      fi
+    fi
+
+    if ! install_runtime; then
+      echo "The WasmEdge Agent install failed. The log is at $install_log" >&2
+      echo "Run omarchy-install-wasmedge-agent --now again to retry." >&2
+      exit 1
+    fi
+
+    if ! runtime_ready; then
+      echo "The WasmEdge Agent install finished, and the runtime is still not ready." >&2
+      echo "The log is at $install_log" >&2
+      exit 1
+    fi
+
+    # The runtime answers ready, so nothing is left to put right: the copy moved
+    # aside is no longer wanted, and nothing at the launcher path is this
+    # command's to reclaim. Disarmed first, so the trap cannot record the
+    # command a finished install left as though it were unfinished work.
+    trap - EXIT
+    restore_displaced "$launcher_aside"
+    rm -f -- "$install_pending"
     ;;
   --owns)
     if omarchy_owns_launcher; then
