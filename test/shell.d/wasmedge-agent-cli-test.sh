@@ -272,3 +272,241 @@ run --nonsense 2>"$tmpdir/err" || status=$?
 grep -q "Usage: omarchy-install-wasmedge-agent" "$tmpdir/err" ||
   fail "an unknown argument prints usage to stderr" "$(cat "$tmpdir/err")"
 pass "an unknown argument prints usage and exits 2"
+
+# --- Task 2: the launcher ---------------------------------------------------
+
+rm -rf "$home"
+: >"$curl_log"
+run || fail "writing the launcher succeeds on a clean machine"
+[[ -f $launcher && -x $launcher ]] || fail "the launcher is an executable regular file"
+[[ ! -L $launcher ]] || fail "the launcher is a regular file and not a link"
+grep -qxF "$marker" "$launcher" || fail "the launcher carries the ownership marker"
+run --owns || fail "the command owns the launcher it just wrote"
+pass "a clean machine gets an executable, marked launcher"
+
+# User provisioning calls this on every machine. The agent is minutes of
+# download, so writing the launcher must reach the network for nothing.
+[[ ! -s $curl_log ]] || fail "writing the launcher downloads nothing" "$(tr '\0' ' ' <"$curl_log")"
+pass "writing the launcher downloads nothing"
+
+before=$(cat "$launcher")
+run || fail "writing the launcher again succeeds"
+[[ $(cat "$launcher") == "$before" ]] || fail "writing the launcher again produces the same file"
+pass "writing the launcher is byte-identical on a second run"
+
+chmod -x "$launcher"
+run || fail "repairing the launcher succeeds"
+[[ -x $launcher ]] || fail "a launcher of ours that lost its executable bit is repaired"
+pass "a launcher of ours that lost its executable bit is repaired"
+
+foreign_body='#!/bin/bash
+echo mine'
+printf '%s\n' "$foreign_body" >"$launcher"
+chmod +x "$launcher"
+run || fail "a foreign launcher is not an error"
+[[ $(cat "$launcher") == "$foreign_body" ]] || fail "a foreign file at the launcher path is left alone"
+pass "a foreign file at the launcher path is left alone"
+
+# The marker is matched whole. A wrapper whose own comment quotes it -- including
+# one that quotes it to say it is not ours -- is still the user's file, and a
+# substring match would silently write over it.
+quoting_body="#!/bin/bash
+# This is not the \"$marker\" launcher; it is mine.
+echo mine"
+printf '%s\n' "$quoting_body" >"$launcher"
+chmod +x "$launcher"
+if run --owns; then
+  fail "a file that only quotes the marker inside a longer line is not ours"
+fi
+run || fail "a file that only quotes the marker is not an error"
+[[ $(cat "$launcher") == "$quoting_body" ]] ||
+  fail "a file that only quotes the marker is left alone" "$(cat "$launcher")"
+pass "a file that quotes the marker inside a longer line is not ours and is left alone"
+
+rm -f "$launcher"
+[[ ! -e "$tmpdir/somewhere-else" ]] || fail "the dangling link's target does not exist before the run"
+ln -s "$tmpdir/somewhere-else" "$launcher"
+run || fail "a foreign symbolic link is not an error"
+[[ -L $launcher ]] || fail "a foreign symbolic link at the launcher path is left alone"
+[[ $(readlink "$launcher") == "$tmpdir/somewhere-else" ]] || fail "the link still points where it did"
+[[ ! -e "$tmpdir/somewhere-else" ]] || fail "nothing was written through the dangling foreign link"
+pass "a foreign symbolic link at the launcher path is left alone"
+rm -f "$launcher"
+
+# The body goes to a sibling temporary file and is renamed into place, because a
+# rename inside a directory is atomic. No run can then leave a half-written file
+# at the launcher path: that file carries no marker, so every later run reads it
+# as somebody else's, exits 0, and never repairs it, and nothing this command
+# offers recovers from that. `cat` writes the body, so a cat that writes part of
+# it and then fails is the failure to model.
+truncating_bin="$tmpdir/truncating-bin"
+mkdir -p "$truncating_bin"
+cat >"$truncating_bin/cat" <<'SH'
+#!/bin/bash
+
+# The shebang and the beginning of the marker line, then the failure a full disk
+# or a signal delivers.
+head -c 40
+exit 1
+SH
+chmod +x "$truncating_bin/cat"
+
+rm -rf "$home"
+mkdir -p "$home/.local/bin"
+status=0
+OMARCHY_TEST_PATH="$truncating_bin:$base_path" run >/dev/null 2>&1 || status=$?
+(( status != 0 )) || fail "a failed write is reported"
+if [[ -e $launcher ]] && ! grep -qxF "$marker" "$launcher"; then
+  fail "a failed write leaves no unmarked file at the launcher path" "$(cat "$launcher")"
+fi
+shopt -s nullglob dotglob
+leftover=("$home/.local/bin"/*)
+shopt -u nullglob dotglob
+(( ${#leftover[@]} == 0 )) ||
+  fail "a failed write leaves no temporary file behind" "${leftover[*]}"
+pass "a failed write leaves neither an unmarked launcher nor a temporary file"
+
+# A launcher of ours already at the path is the worse half: the redirect that
+# used to write it truncated the live file before a byte of the new body
+# arrived, so a write that then failed destroyed a launcher that worked.
+rm -rf "$home"
+run || fail "writing the launcher succeeds"
+before=$(cat "$launcher")
+status=0
+OMARCHY_TEST_PATH="$truncating_bin:$base_path" run >/dev/null 2>&1 || status=$?
+(( status != 0 )) || fail "a failed rewrite is reported"
+[[ $(cat "$launcher") == "$before" ]] ||
+  fail "a failed rewrite leaves the launcher it could not replace intact" "$(cat "$launcher")"
+run --owns || fail "a failed rewrite leaves a launcher Omarchy still owns"
+shopt -s nullglob dotglob
+leftover=("$home/.local/bin"/*)
+shopt -u nullglob dotglob
+(( ${#leftover[@]} == 1 )) ||
+  fail "a failed rewrite leaves no temporary file behind" "${leftover[*]}"
+pass "a failed rewrite leaves the launcher it could not replace intact"
+
+# The ownership test runs before the body exists, so a user's own installer can
+# create the file in the window between the two. The live path is asked again
+# just before the rename, and a file that has appeared there is left alone.
+# `cat` writes the body, so a cat that plants a foreign file before writing it
+# stands in for that window exactly.
+racing_bin="$tmpdir/racing-bin"
+mkdir -p "$racing_bin"
+cat >"$racing_bin/cat" <<'SH'
+#!/bin/bash
+
+printf '%s\n' "#!/bin/bash" "echo mine" >"$HOME/.local/bin/wasmedge-agent"
+chmod +x "$HOME/.local/bin/wasmedge-agent"
+exec /usr/bin/cat
+SH
+chmod +x "$racing_bin/cat"
+
+rm -rf "$home"
+mkdir -p "$home/.local/bin"
+OMARCHY_TEST_PATH="$racing_bin:$base_path" run ||
+  fail "a file that appears while the launcher is written is not an error"
+[[ $(cat "$launcher") == "$foreign_body" ]] ||
+  fail "a user's file that appears while the launcher is written is left alone" \
+    "$(cat "$launcher")"
+shopt -s nullglob dotglob
+leftover=("$home/.local/bin"/*)
+shopt -u nullglob dotglob
+(( ${#leftover[@]} == 1 )) ||
+  fail "the discarded write leaves no temporary file behind" "${leftover[*]}"
+pass "a user's file that appears while the launcher is written is left alone"
+
+# The window the test above cannot reach is the one after that last ownership
+# test and before the file is published. Asking and then renaming leaves it
+# open, because a rename replaces whatever it lands on. These stubs stand in
+# that window: each creates a user's command at the launcher path in the instant
+# before the real tool runs. Both publication tools are stubbed, so the
+# injection happens whichever one the command reaches for, and the user's file
+# has to survive either way.
+publish_race_bin="$tmpdir/publish-race-bin"
+mkdir -p "$publish_race_bin"
+racing_body='#!/bin/bash
+echo theirs'
+for tool in ln mv; do
+  cat >"$publish_race_bin/$tool" <<SH
+#!/bin/bash
+
+if [[ \$* == *"$launcher"* ]]; then
+  printf '%s\\n' '$racing_body' >"$launcher"
+  chmod +x "$launcher"
+fi
+
+exec $(command -v "$tool") "\$@"
+SH
+  chmod +x "$publish_race_bin/$tool"
+done
+
+rm -rf "$home"
+mkdir -p "$home/.local/bin"
+OMARCHY_TEST_PATH="$publish_race_bin:$base_path" run ||
+  fail "a file that appears just before the launcher is published is not an error"
+[[ $(cat "$launcher") == "$racing_body" ]] ||
+  fail "a user's file that appears just before publication is not replaced" \
+    "$(cat "$launcher")"
+if run --owns; then
+  fail "the file that appeared just before publication is not claimed as Omarchy's"
+fi
+shopt -s nullglob dotglob
+leftover=("$home/.local/bin"/*)
+shopt -u nullglob dotglob
+(( ${#leftover[@]} == 1 )) ||
+  fail "the abandoned publication leaves no temporary file behind" "${leftover[*]}"
+pass "a user's file that appears just before publication is not replaced"
+
+# Publication is not the only window. When the launcher path already holds a
+# launcher of ours, the link above it fails and the repair runs instead, and the
+# repair has a window of its own: its ownership test stands before the move that
+# acts on the path. Only mv is stubbed for this one -- a stub ln would plant the
+# file before that ownership test and never reach the window under test.
+repair_race_bin="$tmpdir/repair-race-bin"
+mkdir -p "$repair_race_bin"
+cat >"$repair_race_bin/mv" <<SH
+#!/bin/bash
+
+if [[ \$* == *"$launcher"* ]]; then
+  printf '%s\\n' '$racing_body' >"$launcher"
+  chmod +x "$launcher"
+fi
+
+exec $(command -v mv) "\$@"
+SH
+chmod +x "$repair_race_bin/mv"
+
+rm -rf "$home"
+run || fail "writing the launcher succeeds"
+OMARCHY_TEST_PATH="$repair_race_bin:$base_path" run ||
+  fail "a file that appears just before a repair is not an error"
+[[ $(cat "$launcher") == "$racing_body" ]] ||
+  fail "a user's file that appears just before a repair is not replaced" \
+    "$(cat "$launcher")"
+if run --owns; then
+  fail "the file that appeared just before a repair is not claimed as Omarchy's"
+fi
+shopt -s nullglob dotglob
+leftover=("$home/.local/bin"/*)
+shopt -u nullglob dotglob
+(( ${#leftover[@]} == 1 )) ||
+  fail "the abandoned repair leaves no temporary file behind" "${leftover[*]}"
+pass "a user's file that appears just before a repair is not replaced"
+
+# The warm path: an agent is already installed, so the launcher hands straight
+# over to it and reaches no installer. The arguments must arrive as they left,
+# including a space and a string that would expand if it were ever evaluated.
+rm -rf "$home"
+run || fail "writing the launcher succeeds"
+mkdir -p "$npm_prefix/bin"
+cp "$agent_bin/wasmedge-agent" "$npm_prefix/bin/wasmedge-agent"
+: >"$tmpdir/agent.log"
+: >"$curl_log"
+OMARCHY_TEST_PATH="$home/.local/bin:$base_path" run_launcher chat --model "a b" '$HOME' ||
+  fail "the launcher runs the installed agent"
+printf '%s\0' chat --model "a b" '$HOME' >"$tmpdir/expected-argv"
+cmp -s "$tmpdir/agent.log" "$tmpdir/expected-argv" ||
+  fail "the launcher passes its arguments through unchanged" "$(tr '\0' ' ' <"$tmpdir/agent.log")"
+[[ ! -s $curl_log ]] || fail "the launcher installs nothing when an agent is already there"
+pass "the launcher runs the installed agent with its arguments unchanged"
+rm -rf "$npm_prefix"

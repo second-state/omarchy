@@ -93,7 +93,215 @@ omarchy_owns_launcher() {
   omarchy_wrote "$launcher"
 }
 
+foreign_launcher() {
+  [[ -e $launcher || -L $launcher ]] && ! omarchy_owns_launcher
+}
+
+# The launcher body carries the resolution rule from real_agent inline. `set -e`
+# is deliberately absent: the resolution probes fail as a normal part of their
+# work, and the launcher's job is to hand over to the agent, not to abort.
+#
+# Printed rather than written, so write_launcher decides where it lands and can
+# put it in place atomically.
+launcher_body() {
+  cat <<EOF
+#!/bin/bash
+
+$marker
+
+# Omarchy writes this file at provision time so wasmedge-agent resolves before
+# the agent exists. The first run installs the runtime and hands over to it.
+# Afterwards the mise shim precedes this file on PATH and it is no longer
+# reached. The resolution rule is the one in omarchy-install-wasmedge-agent,
+# inline so this file still works when that command is absent.
+
+set -uo pipefail
+
+wasmedge_agent_marker='$marker'
+
+wasmedge_agent_real() {
+  local candidate prefix
+
+  while IFS= read -r candidate; do
+    [[ -f \$candidate && -x \$candidate ]] || continue
+    if grep -qxF "\$wasmedge_agent_marker" "\$candidate" 2>/dev/null; then
+      continue
+    fi
+    printf '%s\n' "\$candidate"
+    return 0
+  done < <(type -aP wasmedge-agent 2>/dev/null)
+
+  prefix=\$(npm prefix -g 2>/dev/null) || return 1
+  [[ -n \$prefix && -f \$prefix/bin/wasmedge-agent && -x \$prefix/bin/wasmedge-agent ]] || return 1
+  # The whole-line marker test the PATH candidates get, for the same reason. When
+  # npm's global prefix is ~/.local -- the ordinary way to avoid sudo npm -- this
+  # candidate is the launcher, and answering with it makes the launcher exec
+  # itself forever.
+  if grep -qxF "\$wasmedge_agent_marker" "\$prefix/bin/wasmedge-agent" 2>/dev/null; then
+    return 1
+  fi
+  printf '%s\n' "\$prefix/bin/wasmedge-agent"
+}
+
+agent=\$(wasmedge_agent_real) || agent=
+
+if [[ -z \$agent ]]; then
+  # The agent's own installer ends by resolving wasmedge-agent and running
+  # doctor --fix on what it finds, which on a fresh machine is this file. The
+  # sentinel is how this tells "run me" from "you are already inside my own
+  # install", so a resolution that comes up empty in there reports it rather
+  # than starting a second install on top of the first.
+  if [[ -n \${OMARCHY_WASMEDGE_AGENT_INSTALLING:-} ]]; then
+    echo "wasmedge-agent was called from inside its own install, and no agent is installed yet." >&2
+    echo "Not starting another install. The log is at ~/.local/state/omarchy/wasmedge-agent-install.log" >&2
+    exit 1
+  fi
+
+  echo "Installing WasmEdge Agent (this takes a few minutes)..." >&2
+  if ! omarchy-install-wasmedge-agent --now >&2; then
+    exit 1
+  fi
+  agent=\$(wasmedge_agent_real) || agent=
+fi
+
+# An install that reports success and still resolves nothing is a failure, not a
+# reason to run an empty command name.
+if [[ -z \$agent ]]; then
+  echo "WasmEdge Agent installed, and no wasmedge-agent was found on PATH or in the global npm prefix." >&2
+  exit 1
+fi
+
+exec "\$agent" "\$@"
+EOF
+}
+
+# Written to a sibling temporary file and renamed into place, because a rename
+# inside a directory is atomic. Nothing can then leave a half-written file at
+# the launcher path: such a file carries no marker, so every later run reads it
+# as somebody else's, exits 0, and never repairs it, and this command offers
+# nothing that recovers from that.
+write_launcher() {
+  local dir tmp displaced
+
+  dir=$(dirname "$launcher")
+  mkdir -p "$dir"
+
+  tmp=$(mktemp "$dir/.wasmedge-agent.XXXXXX") || return 1
+
+  # mktemp creates the file at 0600, and the launcher is an ordinary executable
+  # in the user's own bin directory, so give it the mode it had when the body
+  # was written straight to the live path.
+  if ! launcher_body >"$tmp" || ! chmod 755 "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+
+  # Creating the launcher and finding out whether the path was free have to be
+  # one operation. A test followed by a rename is not: the ownership test that
+  # allowed this write ran before the body existed, a rename replaces whatever
+  # it lands on, and a user's own installer that creates the command in the
+  # window between the two loses it. link() leaves no such window. It refuses
+  # when the destination exists, and it refuses in the kernel.
+  # EEXIST is an ordinary answer here, not a fault worth printing.
+  if ln -- "$tmp" "$launcher" 2>/dev/null; then
+    rm -f -- "$tmp"
+    return 0
+  fi
+
+  # The path is occupied. Replacing our own launcher is how one that lost its
+  # mode or its body gets repaired -- but the test that permits it stands before
+  # the replacement, and a rename onto the path would destroy whatever it found
+  # there, including a user's own command that took the path in between. So move
+  # what is there off the path first and identify it afterwards. What the window
+  # costs is then a file displaced, which is recoverable, and never a file
+  # deleted, which is not.
+  if omarchy_owns_launcher; then
+    if ! displaced=$(mktemp "$dir/.wasmedge-agent.XXXXXX"); then
+      rm -f -- "$tmp"
+      return 1
+    fi
+
+    if ! mv -fT -- "$launcher" "$displaced"; then
+      rm -f -- "$tmp" "$displaced"
+      return 1
+    fi
+
+    # What was moved is a launcher of ours, and the path it left is still free.
+    # The new body goes in through the same link() that publishes everywhere
+    # else, so a file that arrived while the path stood empty is not replaced.
+    if omarchy_wrote "$displaced" && ln -- "$tmp" "$launcher" 2>/dev/null; then
+      rm -f -- "$tmp" "$displaced"
+      return 0
+    fi
+
+    # Either what was moved was not ours after all, or the path was taken while
+    # it stood empty. Both are answered by putting back what was moved, and
+    # neither leaves this command's launcher at a path that is not its to take.
+    rm -f -- "$tmp"
+    restore_displaced "$displaced" || return 1
+    return 0
+  fi
+
+  rm -f -- "$tmp"
+
+  # Somebody else's file, which stays. An unoccupied path here is link() failing
+  # for its own reasons, and that is this function failing.
+  if [[ -e $launcher || -L $launcher ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Puts a file that was moved off the launcher path back, or drops it once it is
+# no longer wanted. Idempotent, so it is safe on every exit.
+#
+# Never over whatever now holds the launcher path. After a successful install
+# that is the agent npm created, and a user's own file could have arrived while
+# the install ran; either way it is what wasmedge-agent resolves to now, and it
+# is not ours to displace. link() is what enforces that, for the reason
+# write_launcher publishes with it: it refuses an occupied destination in the
+# kernel, so nothing that arrives while this runs is replaced either. It links a
+# symbolic link itself rather than what it resolves to, so one that was displaced
+# goes back naming exactly what it named, dangling or not.
+restore_displaced() {
+  local displaced=$1
+
+  [[ -e $displaced || -L $displaced ]] || return 0
+
+  if ln -- "$displaced" "$launcher" 2>/dev/null; then
+    rm -f -- "$displaced"
+    return 0
+  fi
+
+  # An unoccupied launcher path here is link() failing for its own reasons, and
+  # that is this function failing.
+  if [[ ! -e $launcher && ! -L $launcher ]]; then
+    return 1
+  fi
+
+  # The path is taken and the copy has nowhere to go. Drop it when this command
+  # wrote it. Anything else was displaced by a move that lost the race its
+  # ownership test leaves open, and deleting it would lose the very file this
+  # command exists to leave alone -- so say where it is and leave it there.
+  if omarchy_wrote "$displaced"; then
+    rm -f -- "$displaced"
+    return 0
+  fi
+
+  echo "$displaced is not a launcher this command wrote, and $launcher is taken." >&2
+  echo "It was moved off the launcher path and left there. Move it back or remove it." >&2
+}
+
 case "$mode" in
+  "")
+    # A user who installed their own agent is not an error state, and the
+    # resolution rule already runs their binary.
+    if foreign_launcher; then
+      exit 0
+    else
+      write_launcher
+    fi
+    ;;
   --owns)
     if omarchy_owns_launcher; then
       exit 0
